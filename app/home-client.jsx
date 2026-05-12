@@ -43,13 +43,14 @@ const EVENTS = [
 
 // Mock nowPlaying — shape mirrors the Spotify Web API adapter.
 // Replace with real API state once the token flow is wired.
-const [nowPlaying, setNowPlaying] = useState({
+const MOCK_NOW_PLAYING = {
   isPlaying: false,
   songTitle: "Not Playing",
   artist: "Waiting for Spotify...",
   albumArtUrl: null,
-  progress: 0
-});
+  progress: 0,
+  durationMs: null,
+};
 
 const SUGGESTIONS = [
   { icon: "plus",  label: "Add a new task",         hint: "task",    category: "Create" },
