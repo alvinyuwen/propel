@@ -448,137 +448,249 @@ function HorizonTile({ events, onAddEvent, onDeleteEvent }) {
   );
 }
 
-// ─── Spotify Tile — MOCK only, no live API ────────────────────────────────────
-// Shape is Spotify-Web-API-compatible. Swap MOCK_TRACK for real data when ready.
-const MOCK_TRACK = {
+// ─── Spotify Tile — live /api/spotify polling ─────────────────────────────────
+//
+// Expects your route.js to return either:
+//   { isPlaying: false }                          ← nothing playing
+//   { is_playing, item: { name, artists, album, duration_ms }, progress_ms }
+//
+// Rename your env vars to remove NEXT_PUBLIC_ prefix so secrets stay server-side:
+//   SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET / SPOTIFY_REFRESH_TOKEN
+
+const IDLE_STATE = {
   isPlaying:   false,
-  songTitle:   "Motion (feat. Alina Baraz)",
-  artist:      "Monte Booker",
-  album:       "Gravy",
-  albumArtUrl: null,       // swap with real URL from Spotify API
-  progress:    38,
-  durationMs:  214000,
+  songTitle:   "Nothing playing",
+  artist:      "Open Spotify to start",
+  album:       "",
+  albumArtUrl: null,
+  progressMs:  0,
+  durationMs:  0,
 };
 
 function SpotifyTile() {
-  const [playing,  setPlaying]  = useState(MOCK_TRACK.isPlaying);
-  const [progress, setProgress] = useState(MOCK_TRACK.progress);
-  const duration = MOCK_TRACK.durationMs / 1000;
+  const [track,       setTrack]       = useState(IDLE_STATE);
+  const [localProgress, setLocalProgress] = useState(0); // 0–100
+  const [apiStatus,   setApiStatus]   = useState("connecting"); // connecting | live | idle | error
+  const pollRef = useRef(null);
 
-  useEffect(() => {
-    if (!playing) return;
-    const id = setInterval(() =>
-      setProgress(p => p >= 100 ? 0 : parseFloat((p+0.12).toFixed(2))), 200);
-    return () => clearInterval(id);
-  }, [playing]);
+  // ── Derive display values from track ──────────────────────────────────────
+  const duration = track.durationMs / 1000;  // seconds
 
   const fmt = useCallback((pct) => {
-    const s = Math.round(duration * pct / 100);
-    return `${Math.floor(s/60)}:${String(s%60).padStart(2,"0")}`;
-  }, [duration]);
+    if (!track.durationMs) return "0:00";
+    const s = Math.round(track.durationMs / 1000 * pct / 100);
+    return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+  }, [track.durationMs]);
 
-  const totalFmt = `${Math.floor(duration/60)}:${String(Math.floor(duration%60)).padStart(2,"0")}`;
+  const totalFmt = useMemo(() => {
+    if (!track.durationMs) return "0:00";
+    const s = Math.floor(track.durationMs / 1000);
+    return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+  }, [track.durationMs]);
 
-  const handleScrub = (e) => {
+  // ── Fetch from /api/spotify ───────────────────────────────────────────────
+  const fetchNowPlaying = useCallback(async () => {
+    try {
+      const res = await fetch("/api/spotify");
+
+      // 204 = nothing playing, treat as idle
+      if (res.status === 204) {
+        setTrack(IDLE_STATE);
+        setLocalProgress(0);
+        setApiStatus("idle");
+        return;
+      }
+
+      if (!res.ok) {
+        setApiStatus("error");
+        return;
+      }
+
+      const data = await res.json();
+
+      // Route returned { isPlaying: false } sentinel
+      if (!data.item) {
+        setTrack(IDLE_STATE);
+        setLocalProgress(0);
+        setApiStatus("idle");
+        return;
+      }
+
+      const next = {
+        isPlaying:   data.is_playing,
+        songTitle:   data.item.name,
+        artist:      data.item.artists.map(a => a.name).join(", "),
+        album:       data.item.album.name,
+        albumArtUrl: data.item.album.images?.[0]?.url ?? null,
+        progressMs:  data.progress_ms,
+        durationMs:  data.item.duration_ms,
+      };
+
+      setTrack(next);
+      setLocalProgress(next.durationMs > 0
+        ? parseFloat(((next.progressMs / next.durationMs) * 100).toFixed(2))
+        : 0
+      );
+      setApiStatus(next.isPlaying ? "live" : "idle");
+
+    } catch {
+      setApiStatus("error");
+    }
+  }, []);
+
+  // ── Poll every 3 s ────────────────────────────────────────────────────────
+  useEffect(() => {
+    fetchNowPlaying(); // immediate first fetch
+    pollRef.current = setInterval(fetchNowPlaying, 3000);
+    return () => clearInterval(pollRef.current);
+  }, [fetchNowPlaying]);
+
+  // ── Optimistic progress tick between polls (200 ms) ───────────────────────
+  useEffect(() => {
+    if (!track.isPlaying || !track.durationMs) return;
+    const tickMs  = 200;
+    const tickPct = (tickMs / track.durationMs) * 100;
+    const id = setInterval(() =>
+      setLocalProgress(p => p >= 100 ? 0 : parseFloat((p + tickPct).toFixed(3))), tickMs);
+    return () => clearInterval(id);
+  }, [track.isPlaying, track.durationMs]);
+
+  // ── Scrub handler (UI only — no Spotify seek endpoint needed) ────────────
+  const handleScrub = useCallback((e) => {
     const rect = e.currentTarget.getBoundingClientRect();
-    setProgress(Math.max(0, Math.min(100, parseFloat((((e.clientX-rect.left)/rect.width)*100).toFixed(1)))));
-  };
+    const pct  = Math.max(0, Math.min(100,
+      parseFloat((((e.clientX - rect.left) / rect.width) * 100).toFixed(1))
+    ));
+    setLocalProgress(pct);
+  }, []);
+
+  // ── Status badge ──────────────────────────────────────────────────────────
+  const badge = {
+    connecting: { label: "Connecting…", color: "rgba(148,163,184,0.55)" },
+    live:       { label: "Live",        color: "#1DB954"                },
+    idle:       { label: "Idle",        color: "rgba(148,163,184,0.45)" },
+    error:      { label: "API error",   color: "#fca5a5"                },
+  }[apiStatus];
 
   return (
     <GlassTile style={{ gridColumn:"9 / 13", gridRow:"1 / 2", padding:"20px" }}>
+
+      {/* Header */}
       <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:14 }}>
         <Chip>Now Playing</Chip>
-        <div style={{ display:"flex", alignItems:"center", gap:6 }}>
-          {/* API status badge */}
-          <span style={{
-            ...T.label, fontSize:8.5, color:"rgba(148,163,184,0.6)",
-            background:"rgba(255,255,255,0.04)", border:"0.5px solid rgba(255,255,255,0.08)",
-            borderRadius:5, padding:"2px 7px",
-          }}>Demo mode</span>
+        <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+          {/* Live status dot + label */}
+          <div style={{ display:"flex", alignItems:"center", gap:5 }}>
+            <div style={{
+              width:6, height:6, borderRadius:"50%",
+              background: badge.color,
+              boxShadow: apiStatus === "live" ? "0 0 7px #1DB95488" : "none",
+              transition:"background 0.4s, box-shadow 0.4s",
+            }}/>
+            <span style={{ ...T.mono, fontSize:9.5, color:"rgba(148,163,184,0.6)" }}>
+              {badge.label}
+            </span>
+          </div>
           <span style={{ color:"#1DB954", opacity:0.85 }}><MusicIcon/></span>
         </div>
       </div>
 
-      {/* Track info row */}
+      {/* Track info */}
       <div style={{ display:"flex", gap:12, alignItems:"flex-start", flex:1 }}>
+
         {/* Album art */}
         <div style={{
           width:58, height:58, borderRadius:12, flexShrink:0, overflow:"hidden",
-          background:"linear-gradient(135deg, rgba(221,160,221,0.18) 0%, rgba(147,197,253,0.12) 100%)",
+          background:"linear-gradient(135deg, rgba(221,160,221,0.15) 0%, rgba(147,197,253,0.10) 100%)",
           border:"0.5px solid rgba(221,160,221,0.15)",
           display:"flex", alignItems:"center", justifyContent:"center",
+          transition:"opacity 0.4s",
         }}>
-          {MOCK_TRACK.albumArtUrl
-            ? <img src={MOCK_TRACK.albumArtUrl} alt="Album art" style={{ width:"100%", height:"100%", objectFit:"cover" }}/>
-            : <span style={{ color:"rgba(221,160,221,0.4)" }}><MusicIcon size={22}/></span>
+          {track.albumArtUrl
+            ? <img
+                key={track.albumArtUrl}   // re-mount on track change for fade
+                src={track.albumArtUrl}
+                alt={`${track.album} artwork`}
+                style={{ width:"100%", height:"100%", objectFit:"cover" }}
+              />
+            : <span style={{ color:"rgba(221,160,221,0.35)" }}><MusicIcon size={22}/></span>
           }
         </div>
 
-        {/* Text */}
+        {/* Text block */}
         <div style={{ flex:1, overflow:"hidden", display:"flex", flexDirection:"column", gap:3 }}>
+
           {/* Scrolling title */}
           <div style={{ overflow:"hidden" }}>
             <motion.p
-              animate={ playing ? { x:[0,-80,0] } : { x:0 }}
-              transition={ playing ? { duration:9, repeat:Infinity, ease:"linear" } : {}}
+              key={track.songTitle}
+              animate={ track.isPlaying ? { x:[0, -80, 0] } : { x:0 }}
+              transition={ track.isPlaying ? { duration:9, repeat:Infinity, ease:"linear" } : {}}
               style={{ ...T.body, fontWeight:500, color:C.textPrimary, whiteSpace:"nowrap", letterSpacing:"-0.01em" }}>
-              {MOCK_TRACK.songTitle}
+              {track.songTitle}
             </motion.p>
           </div>
-          <p style={{ ...T.bodySm, color:C.textSecondary }}>{MOCK_TRACK.artist}</p>
-          <p style={{ ...T.bodySm, fontSize:10.5, color:C.textMuted }}>{MOCK_TRACK.album}</p>
-          {/* Live dot */}
-          <div style={{ display:"flex", alignItems:"center", gap:5, marginTop:2 }}>
-            <div style={{
-              width:5, height:5, borderRadius:"50%",
-              background: playing ? "#1DB954" : C.textMuted,
-              boxShadow: playing ? "0 0 6px #1DB95488" : "none",
-              transition:"background 0.3s, box-shadow 0.3s",
-            }}/>
-            <span style={{ ...T.mono, color:C.textMuted, fontSize:9.5 }}>
-              {playing ? "Playing" : "Paused"}
-            </span>
-          </div>
+
+          <p style={{ ...T.bodySm, color:C.textSecondary,
+            overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>
+            {track.artist}
+          </p>
+
+          {track.album && (
+            <p style={{ ...T.bodySm, fontSize:10.5, color:C.textMuted,
+              overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>
+              {track.album}
+            </p>
+          )}
         </div>
       </div>
 
-      {/* Controls */}
+      {/* Progress + play indicator */}
       <div style={{ marginTop:"auto", paddingTop:12 }}>
-        {/* Scrubber */}
         <div onClick={handleScrub} style={{
           position:"relative", height:3,
           background:"rgba(255,255,255,0.09)",
-          borderRadius:99, marginBottom:8, cursor:"pointer",
+          borderRadius:99, marginBottom:8, cursor: track.durationMs ? "pointer" : "default",
         }}>
           <motion.div
             style={{ height:"100%", borderRadius:99, background:C.accent, originX:0 }}
-            animate={{ scaleX:progress/100 }}
-            transition={{ duration:0.18, ease:"linear" }}/>
-          <div style={{
-            position:"absolute", top:"50%", left:`${progress}%`,
-            transform:"translate(-50%,-50%)",
-            width:9, height:9, borderRadius:"50%",
-            background:C.accent, border:"1.5px solid rgba(2,6,23,0.8)",
-            boxShadow:`0 0 6px ${C.accentGlow}`,
-          }}/>
+            animate={{ scaleX: localProgress / 100 }}
+            transition={{ duration:0.18, ease:"linear" }}
+          />
+          {track.durationMs > 0 && (
+            <div style={{
+              position:"absolute", top:"50%", left:`${localProgress}%`,
+              transform:"translate(-50%,-50%)",
+              width:9, height:9, borderRadius:"50%",
+              background:C.accent, border:"1.5px solid rgba(2,6,23,0.8)",
+              boxShadow:`0 0 6px ${C.accentGlow}`,
+            }}/>
+          )}
         </div>
+
         <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center" }}>
-          <span style={{ ...T.mono, color:C.textMuted }}>{fmt(progress)}</span>
-          <motion.button whileTap={{ scale:0.88 }} onClick={() => setPlaying(p => !p)}
-            style={{
-              width:32, height:32, borderRadius:"50%",
-              background: playing ? C.accent : "rgba(221,160,221,0.12)",
-              border:`0.5px solid ${playing ? C.accent : "rgba(221,160,221,0.25)"}`,
-              display:"flex", alignItems:"center", justifyContent:"center",
-              cursor:"pointer", color: playing ? "#fff" : C.accentDark,
-              boxShadow: playing ? `0 0 16px ${C.accentGlow}` : "none",
-              transition:"all 0.2s ease",
-            }}>
-            {playing ? <PauseIcon/> : <PlayIcon/>}
-          </motion.button>
+          <span style={{ ...T.mono, color:C.textMuted }}>{fmt(localProgress)}</span>
+
+          {/* Play state indicator — read-only, reflects Spotify's actual state */}
+          <div style={{
+            width:32, height:32, borderRadius:"50%",
+            background: track.isPlaying ? C.accent : "rgba(221,160,221,0.10)",
+            border:`0.5px solid ${track.isPlaying ? C.accent : "rgba(221,160,221,0.22)"}`,
+            display:"flex", alignItems:"center", justifyContent:"center",
+            color: track.isPlaying ? "#fff" : C.accentDark,
+            boxShadow: track.isPlaying ? `0 0 16px ${C.accentGlow}` : "none",
+            transition:"all 0.3s ease",
+            // Not a button — Spotify play/pause requires a premium scope (user-modify-playback-state)
+            // and a PUT /me/player/play request. Wire it here when you add that scope.
+            opacity: apiStatus === "error" ? 0.35 : 1,
+          }}>
+            {track.isPlaying ? <PauseIcon/> : <PlayIcon/>}
+          </div>
+
           <span style={{ ...T.mono, color:C.textMuted }}>{totalFmt}</span>
         </div>
       </div>
+
     </GlassTile>
   );
 }
@@ -897,9 +1009,9 @@ export default function SakuraShell() {
         input::placeholder { color:#64748b; }
         ::-webkit-scrollbar { width:3px; }
         ::-webkit-scrollbar-track { background:transparent; }
-        ::-webkit-scrollbar-thumb { background:rgba(254, 249, 249, 0.1); border-radius:99px; }
+        ::-webkit-scrollbar-thumb { background:rgba(255,255,255,0.1); border-radius:99px; }
         .horizon-row:hover .horizon-delete { opacity: 0.55 !important; }
-        .horizon-row:hover .horizon-delete:hover { opacity: 1 !important; color: #e9b6ef !important; }
+        .horizon-row:hover .horizon-delete:hover { opacity: 1 !important; color: #fca5a5 !important; }
       `}</style>
 
       <Sidebar onCmdK={() => setCmdOpen(o=>!o)}/>
